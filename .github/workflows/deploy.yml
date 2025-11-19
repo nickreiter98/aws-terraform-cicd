@@ -1,0 +1,63 @@
+# .github/workflows/deploy.yml
+name: Build and Deploy to EC2 via ECR
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
+      - name: Terraform init, validate, and apply
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform apply -auto-approve
+          terraform output -json > outputs.json
+
+      - name: Build, push Docker image and deploy
+        run: |
+          TF_OUTPUT=terraform/outputs.json
+          ECR_URL=$(jq -r '.ecr_url.value' "$TF_OUTPUT")
+          EC2_IP=$(jq -r '.ec2_public_ip.value' "$TF_OUTPUT")
+          AWS_REGION=$(jq -r '.aws_region.value' "$TF_OUTPUT")
+          PROJECT_NAME=$(jq -r '.project_name.value' "$TF_OUTPUT")
+
+          echo "Using existing ec2_key.pem from repo root"
+          chmod 600 ec2_key.pem
+
+          echo "++++Building Docker image++++"
+          cd app
+          docker buildx build --platform linux/amd64 -t ${PROJECT_NAME}:latest --load .
+          cd ..
+
+          echo "+++++Logging into AWS ECR++++"
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${ECR_URL}
+
+          echo "++++Pushing image to ECR++++"
+          docker tag ${PROJECT_NAME}:latest ${ECR_URL}:latest
+          docker push ${ECR_URL}:latest
+
+          echo "++++ Executing remote EC2 script ++++"
+          ssh -o StrictHostKeyChecking=no -i "ec2_key.pem" ec2-user@${EC2_IP} \
+            "AWS_REGION='${AWS_REGION}' ECR_URL='${ECR_URL}' PROJECT_NAME='${PROJECT_NAME}' bash -s" \
+            < deploy_docker_app.sh
